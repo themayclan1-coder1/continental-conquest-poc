@@ -15,13 +15,13 @@ TERRAIN_SPECS = {
     "Mountains":    {"money": 4500, "food": 0,  "fuel": 0,   "parts": 0,  "vaccine": 0, "fuel_cost": 2.0}
 }
 
-# Vehicle base fuel consumption (from Master Vehicle Chart)
-VEHICLE_FUEL = {
-    "Car": 2,
-    "Bike": 1,
-    "Van": 3,
-    "Bus": 5,
-    "Truck": 7
+# Vehicle Stats (Fuel, Max HP, and Damage Roll Generator)
+VEHICLE_STATS = {
+    "Car":  {"fuel": 2, "hp": 30, "roll": lambda: sum(random.randint(1, 6) for _ in range(2)) + 1},  # 2d6+1
+    "Bike": {"fuel": 1, "hp": 10, "roll": lambda: random.randint(1, 3)},                              # 1d3
+    "Van":  {"fuel": 3, "hp": 50, "roll": lambda: sum(random.randint(1, 6) for _ in range(3)) + 2},  # 3d6+2
+    "Bus":  {"fuel": 5, "hp": 75, "roll": lambda: sum(random.randint(1, 6) for _ in range(4)) + 1},  # 4d6+1
+    "Truck":{"fuel": 7, "hp": 150, "roll": lambda: sum(random.randint(1, 6) for _ in range(8)) + 4}  # 8d6+4
 }
 
 DIRECTIONS = {
@@ -55,7 +55,7 @@ def init_game():
     grid[(2, 0)]["owner"] = "Clan_B"
     grid[(2, 0)]["city"] = "Fort B"
 
-    # Clan Stockpiles (Starting baseline)
+    # Clan Stockpiles
     clans = {
         "Clan_A": {
             "name": "Northern Coalition", 
@@ -77,21 +77,23 @@ def init_game():
         }
     }
 
-    # Starting convoys with 1 Car, 2 Bikes (Starting vehicles for land convoy)
+    # Starting Convoys
     convoys = {
         "Convoy_A1": {
             "clan": "Clan_A", 
             "q": -2, "r": 0, 
             "vehicles": {"Car": 1, "Bike": 2}, 
             "troops": 25, 
-            "mode": "CAPTURE"
+            "mode": "CAPTURE",
+            "hidden": False
         },
         "Convoy_B1": {
             "clan": "Clan_B", 
             "q": 2, "r": 0, 
             "vehicles": {"Car": 1, "Bike": 2}, 
             "troops": 25, 
-            "mode": "CAPTURE"
+            "mode": "CAPTURE",
+            "hidden": False
         }
     }
 
@@ -103,185 +105,52 @@ if "game" not in st.session_state:
 game = st.session_state.game
 
 def get_convoy_base_fuel(vehicles):
-    return sum(VEHICLE_FUEL[v] * count for v, count in vehicles.items())
+    return sum(VEHICLE_STATS[v]["fuel"] * count for v, count in vehicles.items())
 
-# 3. AI Orders Heuristic
-def ai_generate_moves(convoy_id, convoy_data):
-    q, r = convoy_data["q"], convoy_data["r"]
-    moves = []
-    for _ in range(5):  # 5 movement pulses per turn
-        valid_neighbors = []
-        for d_name, (dq, dr) in DIRECTIONS.items():
-            nq, nr = q + dq, r + dr
-            if (nq, nr) in game["grid"]:
-                target = game["grid"][(nq, nr)]
-                score = 1
-                if target["owner"] != convoy_data["clan"]:
-                    score += 3
-                valid_neighbors.append((score, nq, nr, d_name))
-        
-        if valid_neighbors:
-            valid_neighbors.sort(key=lambda x: x[0] + random.random(), reverse=True)
-            chosen = valid_neighbors[0]
-            moves.append((chosen[1], chosen[2], chosen[3]))
-            q, r = chosen[1], chosen[2]
-            
-    return moves
+def calculate_salvo(convoy):
+    damage = 0
+    # Vehicles damage roll
+    for v_name, count in convoy["vehicles"].items():
+        for _ in range(count):
+            damage += VEHICLE_STATS[v_name]["roll"]()
+    # Troops fire: 50% chance each to score 1 pt
+    for _ in range(convoy["troops"]):
+        if random.random() < 0.5:
+            damage += 1
+    return damage
 
-# 4. Turn Processing Engine
-def run_turn():
-    logs = []
-    logs.append(f"=== RUNNING TURN {game['turn']} ===")
+def resolve_convoy_combat(c_atk_id, c_def_id, q, r):
+    """Resolves round of vehicle/troop combat per Continental Conquest rules."""
+    c_atk = game["convoys"][c_atk_id]
+    c_def = game["convoys"][c_def_id]
+    clan_atk = game["clans"][c_atk["clan"]]
+    clan_def = game["clans"][c_def["clan"]]
 
-    # Phase 1: Income Phase (Hexes produce resources)
-    for clan_id, clan_data in game["clans"].items():
-        income_money = 0
-        income_food = 0
-        income_fuel = 0
-        income_parts = 0
-        income_vaccine = 0
+    combat_logs = [f"⚔️ BATTLE at ({q}, {r}) between {c_atk_id} and {c_def_id}!"]
 
-        for (q, r), cell in game["grid"].items():
-            if cell["owner"] == clan_id:
-                specs = TERRAIN_SPECS[cell["terrain"]]
-                income_money += specs["money"]
-                income_food += specs["food"]
-                income_fuel += specs["fuel"]
-                income_parts += specs["parts"]
-                income_vaccine += specs["vaccine"]
+    # Both sides roll salvos
+    salvo_atk = calculate_salvo(c_atk)
+    salvo_def = calculate_salvo(c_def)
 
-        clan_data["money"] += income_money
-        clan_data["food"] += income_food
-        clan_data["fuel"] += income_fuel
-        clan_data["parts"] += income_parts
-        clan_data["vaccine"] += income_vaccine
+    # Helper function to apply damage
+    def apply_damage(convoy, clan, incoming_dmg, target_name):
+        dmg_rem = incoming_dmg
+        troops_lost = 0
+        vehicles_lost = []
 
-        logs.append(
-            f"Income for {clan_data['name']}: +${income_money}, "
-            f"+{income_food} food, +{income_fuel} fuel, +{income_parts} parts"
-        )
+        # List all vehicle instances
+        v_list = []
+        for v_name, count in convoy["vehicles"].items():
+            for _ in range(count):
+                v_list.append({"type": v_name, "hp": VEHICLE_STATS[v_name]["hp"]})
 
-    # Phase 2: Convoy Movement Pulses (with Fuel & Food logistics)
-    for cid, cdata in game["convoys"].items():
-        clan_data = game["clans"][cdata["clan"]]
-        base_fuel_burn = get_convoy_base_fuel(cdata["vehicles"])
-        moves = ai_generate_moves(cid, cdata)
-
-        for step, (nq, nr, direction) in enumerate(moves, 1):
-            target_hex = game["grid"][(nq, nr)]
-            terrain = target_hex["terrain"]
-            multiplier = TERRAIN_SPECS[terrain]["fuel_cost"]
-            fuel_needed = int(np.ceil(base_fuel_burn * multiplier))
-
-            # Fuel Check
-            if clan_data["fuel"] < fuel_needed:
-                logs.append(f"Pulse {step}: {cid} ({cdata['clan']}) STALLED out of fuel! Needed {fuel_needed}, had {clan_data['fuel']}.")
-                break  # Convoy stops moving for the rest of the turn
-
-            clan_data["fuel"] -= fuel_needed
-
-            # Move convoy
-            cdata["q"], cdata["r"] = nq, nr
-
-            # Pulse Food Consumption (1/10th of troop count per pulse)
-            food_needed = max(1, int(cdata["troops"] / 10))
-            if clan_data["food"] >= food_needed:
-                clan_data["food"] -= food_needed
-            else:
-                clan_data["food"] = 0
-                # Starvation: 10% chance of desertion check
-                if random.random() < 0.10 and cdata["troops"] > 0:
-                    cdata["troops"] -= 1
-                    logs.append(f"Pulse {step}: {cid} ({cdata['clan']}) suffered a troop desertion due to starvation!")
-
-            # Capture Check
-            if target_hex["owner"] != cdata["clan"]:
-                if cdata["troops"] >= target_hex["defense"]:
-                    target_hex["owner"] = cdata["clan"]
-                    losses = min(cdata["troops"], target_hex["defense"])
-                    cdata["troops"] -= losses
-                    logs.append(
-                        f"Pulse {step}: {cid} entered ({nq}, {nr}) [{terrain}, -{fuel_needed} fuel] & captured it! Lost {losses} troops."
-                    )
-                else:
-                    logs.append(f"Pulse {step}: {cid} repelled at ({nq}, {nr}) [{terrain}, -{fuel_needed} fuel]!")
-            else:
-                logs.append(f"Pulse {step}: {cid} patrolled friendly hex ({nq}, {nr}) [{terrain}, -{fuel_needed} fuel].")
-                    
-    game["turn"] += 1
-    game["logs"] = logs + game["logs"]
-
-# 5. UI Layout & Dashboard
-st.title("Continental Conquest: 2-AI Proof of Concept")
-
-# Resource Metrics Top Bar
-c1, c2 = st.columns(2)
-with c1:
-    cA = game["clans"]["Clan_A"]
-    hexes_a = sum(1 for c in game["grid"].values() if c["owner"] == "Clan_A")
-    st.markdown(f"### 🔵 {cA['name']} (Hexes: {hexes_a})")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Treasury", f"${cA['money']:,}")
-    m2.metric("Food", f"{cA['food']}")
-    m3.metric("Fuel", f"{cA['fuel']}")
-    m4.metric("Parts", f"{cA['parts']}")
-    m5.metric("Troops", f"{cA['troops']}")
-
-with c2:
-    cB = game["clans"]["Clan_B"]
-    hexes_b = sum(1 for c in game["grid"].values() if c["owner"] == "Clan_B")
-    st.markdown(f"### 🔴 {cB['name']} (Hexes: {hexes_b})")
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Treasury", f"${cB['money']:,}")
-    m2.metric("Food", f"{cB['food']}")
-    m3.metric("Fuel", f"{cB['fuel']}")
-    m4.metric("Parts", f"{cB['parts']}")
-    m5.metric("Troops", f"{cB['troops']}")
-
-st.divider()
-
-# Controls, Logs, and Map
-col_ctrl, col_map = st.columns([1, 2])
-
-with col_ctrl:
-    st.subheader(f"Turn Control (Turn {game['turn']})")
-    if st.button("Run Next Turn (Simulate AI vs AI)", type="primary"):
-        run_turn()
-        st.rerun()
-
-    if st.button("Reset Game"):
-        st.session_state.game = init_game()
-        st.rerun()
-
-    st.write("### Turn Logs")
-    for msg in game["logs"][:15]:
-        st.caption(msg)
-
-with col_map:
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.set_aspect('equal')
-    ax.axis('off')
-
-    # Draw hex grid
-    for (q, r), cell in game["grid"].items():
-        x, y = hex_to_pixel(q, r)
-        color = "#e0e0e0"
-        if cell["owner"] == "Clan_A":
-            color = "#6baed6"  # Blue
-        elif cell["owner"] == "Clan_B":
-            color = "#fb6a4a"  # Red
-            
-        hex_patch = patches.RegularPolygon(
-            (x, y), numVertices=6, radius=0.95, 
-            orientation=0, facecolor=color, edgecolor="#333333", alpha=0.8
-        )
-        ax.add_patch(hex_patch)
-        ax.text(x, y, f"{q},{r}\n{cell['terrain'][:3]}", ha='center', va='center', fontsize=7)
-
-    # Plot convoys
-    for cid, cdata in game["convoys"].items():
-        x, y = hex_to_pixel(cdata["q"], cdata["r"])
-        marker_color = "darkblue" if cdata["clan"] == "Clan_A" else "darkred"
-        ax.plot(x, y, marker='*', markersize=14, color=marker_color)
-
-    st.pyplot(fig)
+        while dmg_rem > 0 and (convoy["troops"] > 0 or len(v_list) > 0):
+            # 1 in 5 (20%) chance to target troop
+            if convoy["troops"] > 0 and (random.random() < 0.20 or len(v_list) == 0):
+                convoy["troops"] -= 1
+                troops_lost += 1
+                dmg_rem -= 1
+            elif len(v_list) > 0:
+                # Vehicle hit takes 5-10 dmg
+                hit = min(dmg_rem, random.randint(5, 10))
+                idx = random
