@@ -1,8 +1,7 @@
 import streamlit as st
 import random
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import numpy as np
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Continental Conquest POC", layout="wide")
 
@@ -15,7 +14,6 @@ TERRAIN_SPECS = {
     "Mountains":    {"money": 4500, "food": 0,  "fuel": 0,   "parts": 0,  "vaccine": 0, "fuel_cost": 2.0}
 }
 
-# Vehicle Stats (Fuel, Max HP, Troop Capacity, and Damage Roll)
 VEHICLE_STATS = {
     "Bike": {"fuel": 1, "hp": 10,  "troops": 1,  "cost": 2500,  "roll": lambda: random.randint(1, 3)},                              # 1d3
     "Car":  {"fuel": 2, "hp": 30,  "troops": 3,  "cost": 7500,  "roll": lambda: sum(random.randint(1, 6) for _ in range(2)) + 1},  # 2d6+1
@@ -33,6 +31,13 @@ def hex_to_pixel(q, r, size=1.0):
     x = size * (np.sqrt(3) * q + np.sqrt(3)/2 * r)
     y = size * (3/2 * r)
     return x, y
+
+def get_hex_polygon(x, y, radius=0.95):
+    """Returns the (x, y) coordinates for a regular hexagon polygon."""
+    angles = np.linspace(0, 2 * np.pi, 7)
+    px = x + radius * np.cos(angles)
+    py = y + radius * np.sin(angles)
+    return px.tolist(), py.tolist()
 
 def get_convoy_max_troops(vehicles):
     return sum(VEHICLE_STATS[v]["troops"] * count for v, count in vehicles.items())
@@ -85,7 +90,7 @@ def init_game():
         }
     }
 
-    # Starting Convoys: 1 Bus + 1 Van + 2 Bikes (Starting with real troop capacity)
+    # Starting Convoys
     convoys = {
         "Convoy_A1": {
             "clan": "Clan_A", 
@@ -202,7 +207,7 @@ def ai_generate_moves(convoy_id, convoy_data):
                 target = game["grid"][(nq, nr)]
                 score = 1
                 if target["owner"] != convoy_data["clan"]:
-                    score += 4  # Priority to expand/capture
+                    score += 4
                 valid_neighbors.append((score, nq, nr, d_name))
         
         if valid_neighbors:
@@ -221,7 +226,7 @@ def run_turn():
     for cdata in game["convoys"].values():
         cdata["hidden"] = False
 
-    # Phase 1: Income Phase
+    # Income Phase
     for clan_id, clan_data in game["clans"].items():
         income_money = 0
         income_food = 0
@@ -249,29 +254,25 @@ def run_turn():
             f"+{income_food} food, +{income_fuel} fuel, +{income_parts} parts"
         )
 
-    # Phase 2: Pre-Turn AI Enlistment & Troop Resupply
+    # Pre-Turn AI Enlistment & Troop Resupply
     for clan_id, clan_data in game["clans"].items():
-        # Enlist troops if reserves are low and clan has money
         if clan_data["troops"] < 20 and clan_data["money"] >= 2000:
             recruits = 20
             clan_data["money"] -= recruits * 100
             clan_data["troops"] += recruits
             logs.append(f"Pre-Turn: {clan_data['name']} enlisted {recruits} fresh troops for ${recruits*100}.")
 
-    # Reinforce Convoys from Reserve Troop Pool
     for cid, cdata in game["convoys"].items():
         clan_data = game["clans"][cdata["clan"]]
         max_capacity = get_convoy_max_troops(cdata["vehicles"])
         needed = max_capacity - cdata["troops"]
-        
-        # If convoy needs troops and clan has reserves, transfer them
         if needed > 0 and clan_data["troops"] > 0:
             assigned = min(needed, clan_data["troops"])
             cdata["troops"] += assigned
             clan_data["troops"] -= assigned
             logs.append(f"Pre-Turn: {cid} loaded {assigned} troops from reserve (now {cdata['troops']}/{max_capacity}).")
 
-    # Phase 3: Pulse Movement & Combat Resolution
+    # Movement Pulses & Combat
     pulse_moves = {cid: ai_generate_moves(cid, cdata) for cid, cdata in game["convoys"].items()}
 
     for pulse in range(5):
@@ -379,29 +380,95 @@ with col_ctrl:
         st.caption(msg)
 
 with col_map:
-    fig, ax = plt.subplots(figsize=(7, 7))
-    ax.set_aspect('equal')
-    ax.axis('off')
+    # Build Interactive Plotly Hex Map
+    fig = go.Figure()
 
+    # Hex fills and hover data
     for (q, r), cell in game["grid"].items():
         x, y = hex_to_pixel(q, r)
-        color = "#e0e0e0"
+        px, py = get_hex_polygon(x, y)
+        
+        # Color mapping
+        fill_color = "rgba(220, 220, 220, 0.75)"
+        border_color = "#555555"
+        owner_name = "Neutral / Unclaimed"
+        
         if cell["owner"] == "Clan_A":
-            color = "#6baed6"  # Blue
+            fill_color = "rgba(107, 174, 214, 0.85)"  # Blue
+            owner_name = "Northern Coalition (Clan A)"
         elif cell["owner"] == "Clan_B":
-            color = "#fb6a4a"  # Red
-            
-        hex_patch = patches.RegularPolygon(
-            (x, y), numVertices=6, radius=0.95, 
-            orientation=0, facecolor=color, edgecolor="#333333", alpha=0.8
+            fill_color = "rgba(251, 106, 74, 0.85)"   # Red/Coral
+            owner_name = "Southern Syndicate (Clan B)"
+
+        specs = TERRAIN_SPECS[cell["terrain"]]
+        hover_text = (
+            f"<b>Hex ({q}, {r})</b><br>"
+            f"Terrain: {cell['terrain']}<br>"
+            f"Owner: {owner_name}<br>"
+            f"Defense Level: {cell['defense']}<br>"
+            f"<b>Per Turn Yield:</b><br>"
+            f"• Money: ${specs['money']:,}<br>"
+            f"• Food: {specs['food']}<br>"
+            f"• Fuel: {specs['fuel']}<br>"
+            f"• Parts: {specs['parts']}<br>"
+            f"• Vaccine: {specs['vaccine']}"
         )
-        ax.add_patch(hex_patch)
-        ax.text(x, y, f"{q},{r}\n{cell['terrain'][:3]}", ha='center', va='center', fontsize=7)
 
+        fig.add_trace(go.Scatter(
+            x=px, y=py,
+            fill="toself",
+            fillcolor=fill_color,
+            line=dict(color=border_color, width=1.5),
+            hoverinfo="text",
+            hovertext=hover_text,
+            mode="lines",
+            showlegend=False
+        ))
+
+        # Hex center label
+        label_text = f"{q},{r}<br>{cell['terrain'][:3]}"
+        fig.add_trace(go.Scatter(
+            x=[x], y=[y],
+            mode="text",
+            text=[label_text],
+            textfont=dict(size=9, color="#111111"),
+            hoverinfo="none",
+            showlegend=False
+        ))
+
+    # Add Convoy Units
     for cid, cdata in game["convoys"].items():
-        x, y = hex_to_pixel(cdata["q"], cdata["r"])
-        marker_color = "darkblue" if cdata["clan"] == "Clan_A" else "darkred"
-        marker_style = 'X' if cdata["hidden"] else '*'
-        ax.plot(x, y, marker=marker_style, markersize=14, color=marker_color)
+        cx, cy = hex_to_pixel(cdata["q"], cdata["r"])
+        marker_color = "#084594" if cdata["clan"] == "Clan_A" else "#990000"
+        marker_symbol = "x" if cdata["hidden"] else "star"
+        max_cap = get_convoy_max_troops(cdata["vehicles"])
+        v_list = ", ".join(f"{c} {v}" for v, c in cdata["vehicles"].items())
 
-    st.pyplot(fig)
+        convoy_hover = (
+            f"<b>{cid}</b> ({cdata['clan']})<br>"
+            f"Vehicles: {v_list}<br>"
+            f"Troops: {cdata['troops']}/{max_cap}<br>"
+            f"Status: {'HIDDEN' if cdata['hidden'] else 'ACTIVE'}"
+        )
+
+        fig.add_trace(go.Scatter(
+            x=[cx], y=[cy],
+            mode="markers",
+            marker=dict(symbol=marker_symbol, size=18, color=marker_color, line=dict(width=1.5, color="white")),
+            hoverinfo="text",
+            hovertext=convoy_hover,
+            name=cid,
+            showlegend=False
+        ))
+
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        xaxis=dict(showgrid=False, zeroline=False, visible=False),
+        yaxis=dict(showgrid=False, zeroline=False, visible=False, scaleanchor="x", scaleratio=1),
+        plot_bgcolor="rgba(0,0,0,0)",
+        paper_bgcolor="rgba(0,0,0,0)",
+        height=580,
+        dragmode="pan"
+    )
+
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
