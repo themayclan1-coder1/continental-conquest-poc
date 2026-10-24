@@ -106,7 +106,15 @@ def init_game():
         }
     }
 
-    return {"turn": 1, "grid": grid, "clans": clans, "convoys": convoys, "logs": []}
+    return {
+        "turn": 1, 
+        "state": "ORDERS",  # 'ORDERS' or 'RESULTS'
+        "grid": grid, 
+        "clans": clans, 
+        "convoys": convoys, 
+        "latest_logs": [], 
+        "all_logs": []
+    }
 
 if "game" not in st.session_state:
     st.session_state.game = init_game()
@@ -188,7 +196,6 @@ def resolve_convoy_combat(c_atk_id, c_def_id, q, r):
 
     return combat_logs
 
-# 3. AI Orders Heuristic (For Clan B)
 def ai_generate_moves(convoy_id, convoy_data):
     if convoy_data["hidden"]:
         return []
@@ -216,13 +223,13 @@ def ai_generate_moves(convoy_id, convoy_data):
 
 # 4. Turn Processing Engine
 def run_turn(player_orders):
-    logs = []
-    logs.append(f"=== RUNNING TURN {game['turn']} ===")
+    current_turn_logs = []
+    current_turn_logs.append(f"=== COMPLETED TURN {game['turn']} ===")
 
     for cdata in game["convoys"].values():
         cdata["hidden"] = False
 
-    # Phase 1: Income Phase
+    # Income Phase
     for clan_id, clan_data in game["clans"].items():
         income_money = 0
         income_food = 0
@@ -245,39 +252,38 @@ def run_turn(player_orders):
         clan_data["parts"] += income_parts
         clan_data["vaccine"] += income_vaccine
 
-        logs.append(
+        current_turn_logs.append(
             f"Income for {clan_data['name']}: +${income_money}, "
             f"+{income_food} food, +{income_fuel} fuel, +{income_parts} parts"
         )
 
-    # Phase 2: Pre-Turn Orders
-    # Player Clan Orders
+    # Pre-Turn Player Orders
     clan_a = game["clans"]["Clan_A"]
     if player_orders["enlist_troops"] > 0:
         cost = player_orders["enlist_troops"] * 100
         if clan_a["money"] >= cost:
             clan_a["money"] -= cost
             clan_a["troops"] += player_orders["enlist_troops"]
-            logs.append(f"Pre-Turn: You enlisted {player_orders['enlist_troops']} troops for ${cost}.")
+            current_turn_logs.append(f"Pre-Turn: You enlisted {player_orders['enlist_troops']} troops for ${cost}.")
         else:
-            logs.append("Pre-Turn: Enlist order failed: insufficient funds.")
+            current_turn_logs.append("Pre-Turn: Enlist order failed: insufficient funds.")
 
     if player_orders["buy_fuel"] > 0:
         cost = player_orders["buy_fuel"] * 20
         if clan_a["money"] >= cost:
             clan_a["money"] -= cost
             clan_a["fuel"] += player_orders["buy_fuel"]
-            logs.append(f"Pre-Turn: You purchased {player_orders['buy_fuel']} fuel for ${cost}.")
+            current_turn_logs.append(f"Pre-Turn: You purchased {player_orders['buy_fuel']} fuel for ${cost}.")
         else:
-            logs.append("Pre-Turn: Fuel purchase failed: insufficient funds.")
+            current_turn_logs.append("Pre-Turn: Fuel purchase failed: insufficient funds.")
 
-    # AI Clan Pre-Turn Orders
+    # Pre-Turn AI Orders
     clan_b = game["clans"]["Clan_B"]
     if clan_b["troops"] < 20 and clan_b["money"] >= 2000:
         recruits = 20
         clan_b["money"] -= recruits * 100
         clan_b["troops"] += recruits
-        logs.append(f"Pre-Turn: {clan_b['name']} enlisted {recruits} fresh troops.")
+        current_turn_logs.append(f"Pre-Turn: {clan_b['name']} enlisted {recruits} fresh troops.")
 
     # Reinforce Convoys from Reserve Troop Pools
     for cid, cdata in game["convoys"].items():
@@ -288,10 +294,9 @@ def run_turn(player_orders):
             assigned = min(needed, clan_data["troops"])
             cdata["troops"] += assigned
             clan_data["troops"] -= assigned
-            logs.append(f"Pre-Turn: {cid} loaded {assigned} troops from reserve (now {cdata['troops']}/{max_capacity}).")
+            current_turn_logs.append(f"Pre-Turn: {cid} loaded {assigned} troops from reserve (now {cdata['troops']}/{max_capacity}).")
 
-    # Phase 3: Pulse Movements & Encounters
-    # Convert Player directional moves into target coordinates
+    # Pulse Movements & Encounters
     p_moves = []
     cur_q, cur_r = game["convoys"]["Convoy_A1"]["q"], game["convoys"]["Convoy_A1"]["r"]
     for direction in player_orders["pulses"]:
@@ -306,7 +311,6 @@ def run_turn(player_orders):
         else:
             p_moves.append((cur_q, cur_r, "PAUSE"))
 
-    # Generate AI Moves
     ai_moves = ai_generate_moves("Convoy_B1", game["convoys"]["Convoy_B1"])
 
     pulse_plan = {
@@ -324,10 +328,10 @@ def run_turn(player_orders):
             nq, nr, direction = pulse_plan[cid][pulse]
 
             if direction == "PAUSE":
-                logs.append(f"Pulse {pulse+1}: {cid} PAUSED in hex ({nq}, {nr}).")
+                current_turn_logs.append(f"Pulse {pulse+1}: {cid} PAUSED in hex ({nq}, {nr}).")
                 continue
             elif direction == "BLOCKED":
-                logs.append(f"Pulse {pulse+1}: {cid} order failed: target hex off map!")
+                current_turn_logs.append(f"Pulse {pulse+1}: {cid} order failed: target hex off map!")
                 continue
 
             target_hex = game["grid"][(nq, nr)]
@@ -336,13 +340,12 @@ def run_turn(player_orders):
             fuel_needed = int(np.ceil(base_fuel_burn * multiplier))
 
             if clan_data["fuel"] < fuel_needed:
-                logs.append(f"Pulse {pulse+1}: {cid} STALLED out of fuel!")
+                current_turn_logs.append(f"Pulse {pulse+1}: {cid} STALLED out of fuel!")
                 continue
 
             clan_data["fuel"] -= fuel_needed
             cdata["q"], cdata["r"] = nq, nr
 
-            # Pulse food deduction
             food_needed = max(1, int(cdata["troops"] / 10))
             if clan_data["food"] >= food_needed:
                 clan_data["food"] -= food_needed
@@ -350,14 +353,14 @@ def run_turn(player_orders):
                 clan_data["food"] = 0
                 if random.random() < 0.10 and cdata["troops"] > 0:
                     cdata["troops"] -= 1
-                    logs.append(f"Pulse {pulse+1}: {cid} troop deserted due to starvation!")
+                    current_turn_logs.append(f"Pulse {pulse+1}: {cid} troop deserted due to starvation!")
 
             # Combat encounter check
             for other_id, other_cdata in game["convoys"].items():
                 if other_id != cid and other_cdata["clan"] != cdata["clan"]:
                     if other_cdata["q"] == nq and other_cdata["r"] == nr and not other_cdata["hidden"]:
                         c_logs = resolve_convoy_combat(cid, other_id, nq, nr)
-                        logs.extend(c_logs)
+                        current_turn_logs.extend(c_logs)
 
             # Hex capture check
             if not cdata["hidden"]:
@@ -366,12 +369,13 @@ def run_turn(player_orders):
                         target_hex["owner"] = cdata["clan"]
                         losses = min(cdata["troops"], target_hex["defense"])
                         cdata["troops"] -= losses
-                        logs.append(f"Pulse {pulse+1}: {cid} captured ({nq}, {nr})! Lost {losses} troops.")
+                        current_turn_logs.append(f"Pulse {pulse+1}: {cid} captured ({nq}, {nr})! Lost {losses} troops.")
                     else:
-                        logs.append(f"Pulse {pulse+1}: {cid} repelled at ({nq}, {nr}) (Needs {target_hex['defense']}, has {cdata['troops']})!")
+                        current_turn_logs.append(f"Pulse {pulse+1}: {cid} repelled at ({nq}, {nr}) (Needs {target_hex['defense']}, has {cdata['troops']})!")
 
-    game["turn"] += 1
-    game["logs"] = logs + game["logs"]
+    game["latest_logs"] = current_turn_logs
+    game["all_logs"] = current_turn_logs + game["all_logs"]
+    game["state"] = "RESULTS"  # Switch view state to show results
 
 # 5. UI Layout & Dashboard
 st.title("Continental Conquest: Human vs AI")
@@ -411,43 +415,66 @@ with c2:
 
 st.divider()
 
-col_orders, col_map = st.columns([1, 2])
+col_panel, col_map = st.columns([1, 2])
 
-with col_orders:
-    st.subheader(f"Clan Orders Sheet (Turn {game['turn']})")
-    
-    with st.expander("Pre-Turn Procurement", expanded=True):
-        enlist_val = st.number_input("Enlist Troops ($100 each)", min_value=0, max_value=50, value=0, step=5)
-        fuel_val = st.number_input("Buy Fuel ($20 each)", min_value=0, max_value=500, value=0, step=50)
+# Left Column: Switches dynamically between ORDERS and RESULTS
+with col_panel:
+    if game["state"] == "ORDERS":
+        st.subheader(f"Clan Orders Sheet (Turn {game['turn']})")
+        
+        with st.expander("Pre-Turn Procurement", expanded=True):
+            enlist_val = st.number_input("Enlist Troops ($100 each)", min_value=0, max_value=50, value=0, step=5)
+            fuel_val = st.number_input("Buy Fuel ($20 each)", min_value=0, max_value=500, value=0, step=50)
 
-    st.markdown("**Convoy A1 Pulse Moves (5 Pulses)**")
-    dir_options = ["N", "NE", "SE", "S", "SW", "NW", "PAUSE"]
+        st.markdown("**Convoy A1 Pulse Moves (5 Pulses)**")
+        dir_options = ["N", "NE", "SE", "S", "SW", "NW", "PAUSE"]
 
-    p_cols = st.columns(5)
-    pulses = []
-    default_dirs = ["SE", "NE", "SE", "S", "PAUSE"]
-    for i in range(5):
-        with p_cols[i]:
-            d = st.selectbox(f"P{i+1}", dir_options, index=dir_options.index(default_dirs[i]), key=f"pulse_{i}")
-            pulses.append(d)
+        p_cols = st.columns(5)
+        pulses = []
+        default_dirs = ["SE", "NE", "SE", "S", "PAUSE"]
+        for i in range(5):
+            with p_cols[i]:
+                d = st.selectbox(f"P{i+1}", dir_options, index=dir_options.index(default_dirs[i]), key=f"pulse_{i}_{game['turn']}")
+                pulses.append(d)
 
-    if st.button("Submit Orders & Process Turn", type="primary"):
-        player_orders = {
-            "enlist_troops": enlist_val,
-            "buy_fuel": fuel_val,
-            "pulses": pulses
-        }
-        run_turn(player_orders)
-        st.rerun()
+        if st.button("Submit Orders & Process Turn", type="primary"):
+            player_orders = {
+                "enlist_troops": enlist_val,
+                "buy_fuel": fuel_val,
+                "pulses": pulses
+            }
+            run_turn(player_orders)
+            st.rerun()
 
-    if st.button("Reset Game"):
-        st.session_state.game = init_game()
-        st.rerun()
+        if st.button("Reset Game"):
+            st.session_state.game = init_game()
+            st.rerun()
 
-    st.write("### Turn Activity Logs")
-    for msg in game["logs"][:15]:
-        st.caption(msg)
+    elif game["state"] == "RESULTS":
+        st.subheader(f"Turn {game['turn']} Results & Intelligence")
+        st.success(f"Turn {game['turn']} executed successfully!")
 
+        if st.button(f"Proceed to Turn {game['turn'] + 1} Orders ➔", type="primary"):
+            game["turn"] += 1
+            game["state"] = "ORDERS"
+            st.rerun()
+
+        st.write("### Turn Activity Report")
+        for msg in game["latest_logs"]:
+            if "BATTLE" in msg:
+                st.error(msg)
+            elif "captured" in msg:
+                st.success(msg)
+            elif "STALLED" in msg or "deserted" in msg:
+                st.warning(msg)
+            else:
+                st.caption(msg)
+
+        if st.button("Reset Game", key="reset_results"):
+            st.session_state.game = init_game()
+            st.rerun()
+
+# Right Column: Map remains always visible
 with col_map:
     fig = go.Figure()
 
