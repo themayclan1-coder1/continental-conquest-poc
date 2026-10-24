@@ -3,7 +3,7 @@ import random
 import numpy as np
 import plotly.graph_objects as go
 
-st.set_page_config(page_title="Continental Conquest POC", layout="wide")
+st.set_page_config(page_title="Continental Conquest", layout="wide")
 
 # 1. Official Terrain Production & Multipliers (Revision 5.0)
 TERRAIN_SPECS = {
@@ -33,7 +33,6 @@ def hex_to_pixel(q, r, size=1.0):
     return x, y
 
 def get_hex_polygon(x, y, radius=0.95):
-    """Returns the (x, y) coordinates for a regular hexagon polygon."""
     angles = np.linspace(0, 2 * np.pi, 7)
     px = x + radius * np.cos(angles)
     py = y + radius * np.sin(angles)
@@ -60,16 +59,14 @@ def init_game():
                     "troops": 0
                 }
     
-    # Starting bases
     grid[(-2, 0)]["owner"] = "Clan_A"
     grid[(-2, 0)]["city"] = "Fort A"
     grid[(2, 0)]["owner"] = "Clan_B"
     grid[(2, 0)]["city"] = "Fort B"
 
-    # Clan Stockpiles
     clans = {
         "Clan_A": {
-            "name": "Northern Coalition", 
+            "name": "Northern Coalition (Player)", 
             "base": (-2, 0),
             "money": 20000, 
             "food": 150, 
@@ -79,7 +76,7 @@ def init_game():
             "troops": 45
         },
         "Clan_B": {
-            "name": "Southern Syndicate", 
+            "name": "Southern Syndicate (AI)", 
             "base": (2, 0),
             "money": 20000, 
             "food": 150, 
@@ -90,7 +87,6 @@ def init_game():
         }
     }
 
-    # Starting Convoys
     convoys = {
         "Convoy_A1": {
             "clan": "Clan_A", 
@@ -192,7 +188,7 @@ def resolve_convoy_combat(c_atk_id, c_def_id, q, r):
 
     return combat_logs
 
-# 3. AI Orders Heuristic
+# 3. AI Orders Heuristic (For Clan B)
 def ai_generate_moves(convoy_id, convoy_data):
     if convoy_data["hidden"]:
         return []
@@ -219,14 +215,14 @@ def ai_generate_moves(convoy_id, convoy_data):
     return moves
 
 # 4. Turn Processing Engine
-def run_turn():
+def run_turn(player_orders):
     logs = []
     logs.append(f"=== RUNNING TURN {game['turn']} ===")
 
     for cdata in game["convoys"].values():
         cdata["hidden"] = False
 
-    # Income Phase
+    # Phase 1: Income Phase
     for clan_id, clan_data in game["clans"].items():
         income_money = 0
         income_food = 0
@@ -254,14 +250,36 @@ def run_turn():
             f"+{income_food} food, +{income_fuel} fuel, +{income_parts} parts"
         )
 
-    # Pre-Turn AI Enlistment & Troop Resupply
-    for clan_id, clan_data in game["clans"].items():
-        if clan_data["troops"] < 20 and clan_data["money"] >= 2000:
-            recruits = 20
-            clan_data["money"] -= recruits * 100
-            clan_data["troops"] += recruits
-            logs.append(f"Pre-Turn: {clan_data['name']} enlisted {recruits} fresh troops for ${recruits*100}.")
+    # Phase 2: Pre-Turn Orders
+    # Player Clan Orders
+    clan_a = game["clans"]["Clan_A"]
+    if player_orders["enlist_troops"] > 0:
+        cost = player_orders["enlist_troops"] * 100
+        if clan_a["money"] >= cost:
+            clan_a["money"] -= cost
+            clan_a["troops"] += player_orders["enlist_troops"]
+            logs.append(f"Pre-Turn: You enlisted {player_orders['enlist_troops']} troops for ${cost}.")
+        else:
+            logs.append("Pre-Turn: Enlist order failed: insufficient funds.")
 
+    if player_orders["buy_fuel"] > 0:
+        cost = player_orders["buy_fuel"] * 20
+        if clan_a["money"] >= cost:
+            clan_a["money"] -= cost
+            clan_a["fuel"] += player_orders["buy_fuel"]
+            logs.append(f"Pre-Turn: You purchased {player_orders['buy_fuel']} fuel for ${cost}.")
+        else:
+            logs.append("Pre-Turn: Fuel purchase failed: insufficient funds.")
+
+    # AI Clan Pre-Turn Orders
+    clan_b = game["clans"]["Clan_B"]
+    if clan_b["troops"] < 20 and clan_b["money"] >= 2000:
+        recruits = 20
+        clan_b["money"] -= recruits * 100
+        clan_b["troops"] += recruits
+        logs.append(f"Pre-Turn: {clan_b['name']} enlisted {recruits} fresh troops.")
+
+    # Reinforce Convoys from Reserve Troop Pools
     for cid, cdata in game["convoys"].items():
         clan_data = game["clans"][cdata["clan"]]
         max_capacity = get_convoy_max_troops(cdata["vehicles"])
@@ -272,17 +290,46 @@ def run_turn():
             clan_data["troops"] -= assigned
             logs.append(f"Pre-Turn: {cid} loaded {assigned} troops from reserve (now {cdata['troops']}/{max_capacity}).")
 
-    # Movement Pulses & Combat
-    pulse_moves = {cid: ai_generate_moves(cid, cdata) for cid, cdata in game["convoys"].items()}
+    # Phase 3: Pulse Movements & Encounters
+    # Convert Player directional moves into target coordinates
+    p_moves = []
+    cur_q, cur_r = game["convoys"]["Convoy_A1"]["q"], game["convoys"]["Convoy_A1"]["r"]
+    for direction in player_orders["pulses"]:
+        if direction in DIRECTIONS:
+            dq, dr = DIRECTIONS[direction]
+            nxt_q, nxt_r = cur_q + dq, cur_r + dr
+            if (nxt_q, nxt_r) in game["grid"]:
+                p_moves.append((nxt_q, nxt_r, direction))
+                cur_q, cur_r = nxt_q, nxt_r
+            else:
+                p_moves.append((cur_q, cur_r, "BLOCKED"))
+        else:
+            p_moves.append((cur_q, cur_r, "PAUSE"))
+
+    # Generate AI Moves
+    ai_moves = ai_generate_moves("Convoy_B1", game["convoys"]["Convoy_B1"])
+
+    pulse_plan = {
+        "Convoy_A1": p_moves,
+        "Convoy_B1": ai_moves
+    }
 
     for pulse in range(5):
         for cid, cdata in game["convoys"].items():
-            if cdata["hidden"] or pulse >= len(pulse_moves[cid]):
+            if cdata["hidden"] or pulse >= len(pulse_plan[cid]):
                 continue
 
             clan_data = game["clans"][cdata["clan"]]
             base_fuel_burn = get_convoy_base_fuel(cdata["vehicles"])
-            nq, nr, direction = pulse_moves[cid][pulse]
+            nq, nr, direction = pulse_plan[cid][pulse]
+
+            if direction == "PAUSE":
+                logs.append(f"Pulse {pulse+1}: {cid} PAUSED in hex ({nq}, {nr}).")
+                continue
+            elif direction == "BLOCKED":
+                logs.append(f"Pulse {pulse+1}: {cid} order failed: target hex off map!")
+                continue
+
             target_hex = game["grid"][(nq, nr)]
             terrain = target_hex["terrain"]
             multiplier = TERRAIN_SPECS[terrain]["fuel_cost"]
@@ -295,6 +342,7 @@ def run_turn():
             clan_data["fuel"] -= fuel_needed
             cdata["q"], cdata["r"] = nq, nr
 
+            # Pulse food deduction
             food_needed = max(1, int(cdata["troops"] / 10))
             if clan_data["food"] >= food_needed:
                 clan_data["food"] -= food_needed
@@ -321,12 +369,12 @@ def run_turn():
                         logs.append(f"Pulse {pulse+1}: {cid} captured ({nq}, {nr})! Lost {losses} troops.")
                     else:
                         logs.append(f"Pulse {pulse+1}: {cid} repelled at ({nq}, {nr}) (Needs {target_hex['defense']}, has {cdata['troops']})!")
-                    
+
     game["turn"] += 1
     game["logs"] = logs + game["logs"]
 
 # 5. UI Layout & Dashboard
-st.title("Continental Conquest: 2-AI Proof of Concept")
+st.title("Continental Conquest: Human vs AI")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -337,7 +385,7 @@ with c1:
     v_str_a = ", ".join(f"{count} {v}" for v, count in convoy_a["vehicles"].items() if count > 0) or "None"
     status_a = " [HIDDEN]" if convoy_a["hidden"] else ""
     st.markdown(f"### 🔵 {cA['name']} (Hexes: {hexes_a})")
-    st.caption(f"**Convoy A1{status_a}:** {v_str_a} | Troops: **{convoy_a['troops']} / {max_a}**")
+    st.caption(f"**Convoy A1{status_a}:** {v_str_a} | Troops: **{convoy_a['troops']} / {max_a}** | Hex: `({convoy_a['q']}, {convoy_a['r']})`")
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Treasury", f"${cA['money']:,}")
     m2.metric("Food", f"{cA['food']}")
@@ -353,7 +401,7 @@ with c2:
     v_str_b = ", ".join(f"{count} {v}" for v, count in convoy_b["vehicles"].items() if count > 0) or "None"
     status_b = " [HIDDEN]" if convoy_b["hidden"] else ""
     st.markdown(f"### 🔴 {cB['name']} (Hexes: {hexes_b})")
-    st.caption(f"**Convoy B1{status_b}:** {v_str_b} | Troops: **{convoy_b['troops']} / {max_b}**")
+    st.caption(f"**Convoy B1{status_b}:** {v_str_b} | Troops: **{convoy_b['troops']} / {max_b}** | Hex: `({convoy_b['q']}, {convoy_b['r']})`")
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Treasury", f"${cB['money']:,}")
     m2.metric("Food", f"{cB['food']}")
@@ -363,42 +411,60 @@ with c2:
 
 st.divider()
 
-col_ctrl, col_map = st.columns([1, 2])
+col_orders, col_map = st.columns([1, 2])
 
-with col_ctrl:
-    st.subheader(f"Turn Control (Turn {game['turn']})")
-    if st.button("Run Next Turn (Simulate AI vs AI)", type="primary"):
-        run_turn()
+with col_orders:
+    st.subheader(f"Clan Orders Sheet (Turn {game['turn']})")
+    
+    with st.expander("Pre-Turn Procurement", expanded=True):
+        enlist_val = st.number_input("Enlist Troops ($100 each)", min_value=0, max_value=50, value=0, step=5)
+        fuel_val = st.number_input("Buy Fuel ($20 each)", min_value=0, max_value=500, value=0, step=50)
+
+    st.markdown("**Convoy A1 Pulse Moves (5 Pulses)**")
+    dir_options = ["N", "NE", "SE", "S", "SW", "NW", "PAUSE"]
+
+    p_cols = st.columns(5)
+    pulses = []
+    default_dirs = ["SE", "NE", "SE", "S", "PAUSE"]
+    for i in range(5):
+        with p_cols[i]:
+            d = st.selectbox(f"P{i+1}", dir_options, index=dir_options.index(default_dirs[i]), key=f"pulse_{i}")
+            pulses.append(d)
+
+    if st.button("Submit Orders & Process Turn", type="primary"):
+        player_orders = {
+            "enlist_troops": enlist_val,
+            "buy_fuel": fuel_val,
+            "pulses": pulses
+        }
+        run_turn(player_orders)
         st.rerun()
 
     if st.button("Reset Game"):
         st.session_state.game = init_game()
         st.rerun()
 
-    st.write("### Turn Logs")
+    st.write("### Turn Activity Logs")
     for msg in game["logs"][:15]:
         st.caption(msg)
 
 with col_map:
-    # Build Interactive Plotly Hex Map
     fig = go.Figure()
 
-    # Hex fills and hover data
     for (q, r), cell in game["grid"].items():
         x, y = hex_to_pixel(q, r)
         px, py = get_hex_polygon(x, y)
         
-        # Color mapping
         fill_color = "rgba(220, 220, 220, 0.75)"
         border_color = "#555555"
         owner_name = "Neutral / Unclaimed"
         
         if cell["owner"] == "Clan_A":
-            fill_color = "rgba(107, 174, 214, 0.85)"  # Blue
-            owner_name = "Northern Coalition (Clan A)"
+            fill_color = "rgba(107, 174, 214, 0.85)"
+            owner_name = "Northern Coalition (You)"
         elif cell["owner"] == "Clan_B":
-            fill_color = "rgba(251, 106, 74, 0.85)"   # Red/Coral
-            owner_name = "Southern Syndicate (Clan B)"
+            fill_color = "rgba(251, 106, 74, 0.85)"
+            owner_name = "Southern Syndicate (AI)"
 
         specs = TERRAIN_SPECS[cell["terrain"]]
         hover_text = (
@@ -425,7 +491,6 @@ with col_map:
             showlegend=False
         ))
 
-        # Hex center label
         label_text = f"{q},{r}<br>{cell['terrain'][:3]}"
         fig.add_trace(go.Scatter(
             x=[x], y=[y],
@@ -436,7 +501,6 @@ with col_map:
             showlegend=False
         ))
 
-    # Add Convoy Units
     for cid, cdata in game["convoys"].items():
         cx, cy = hex_to_pixel(cdata["q"], cdata["r"])
         marker_color = "#084594" if cdata["clan"] == "Clan_A" else "#990000"
@@ -445,7 +509,7 @@ with col_map:
         v_list = ", ".join(f"{c} {v}" for v, c in cdata["vehicles"].items())
 
         convoy_hover = (
-            f"<b>{cid}</b> ({cdata['clan']})<br>"
+            f"<b>{cid}</b> ({'You' if cdata['clan'] == 'Clan_A' else 'AI'})<br>"
             f"Vehicles: {v_list}<br>"
             f"Troops: {cdata['troops']}/{max_cap}<br>"
             f"Status: {'HIDDEN' if cdata['hidden'] else 'ACTIVE'}"
